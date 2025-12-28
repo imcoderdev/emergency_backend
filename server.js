@@ -21,7 +21,7 @@ const io = socketIo(server, {
   cors: {
     origin: [
       'http://localhost:5173',
-      'https://emergency-frontend-gx2k-git-main-devs-projects-89798064.vercel.app'
+      'https://emergency-frontend-gx2k.vercel.app'
     ],
     methods: ['GET', 'POST', 'PATCH', 'DELETE'],
     credentials: true
@@ -34,7 +34,7 @@ app.set('io', io);
 // Allowed origins for CORS
 const allowedOrigins = [
   'http://localhost:5173',
-  'https://emergency-frontend-gx2k-git-main-devs-projects-89798064.vercel.app'
+  'https://emergency-frontend-gx2k.vercel.app'
 ];
 
 // Middleware
