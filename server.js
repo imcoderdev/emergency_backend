@@ -68,10 +68,14 @@ app.use(generalLimiter);
 // Socket.IO setup with CORS
 const io = socketIo(server, {
   cors: {
-    origin: [
-      'http://localhost:5173',
-      'https://emergency-frontend-gx2k.vercel.app'
-    ],
+    origin: (origin, callback) => {
+      // Allow all Vercel domains and localhost
+      if (!origin || origin.includes('.vercel.app') || origin.includes('localhost') || origin.includes('127.0.0.1')) {
+        callback(null, true);
+      } else {
+        callback(null, true); // Allow all for hackathon demo
+      }
+    },
     methods: ['GET', 'POST', 'PATCH', 'DELETE'],
     credentials: true
   }
@@ -101,11 +105,17 @@ app.use(cors({
       return callback(null, true);
     }
     
+    // Allow all Vercel domains
+    if (origin.includes('.vercel.app')) {
+      return callback(null, true);
+    }
+    
     if (allowedOrigins.includes(origin)) {
       callback(null, true);
     } else {
       console.log('CORS blocked origin:', origin);
-      callback(new Error('Not allowed by CORS'));
+      // In production, still allow but log it
+      callback(null, true);
     }
   },
   credentials: true
