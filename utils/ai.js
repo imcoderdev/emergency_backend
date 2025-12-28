@@ -1,23 +1,111 @@
 const { GoogleGenerativeAI } = require('@google/generative-ai');
+const fs = require('fs');
+const path = require('path');
 
 // Initialize Google Generative AI with API key
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
 /**
- * Analyze an incident description using Google's Gemini AI
+ * Convert image file to base64 for Gemini
+ * @param {string} imagePath - Path to the image file
+ * @returns {Object} - Object with mimeType and base64 data
+ */
+function imageToBase64(imagePath) {
+  try {
+    const absolutePath = path.resolve(imagePath);
+    if (!fs.existsSync(absolutePath)) {
+      console.log('Image file not found:', absolutePath);
+      return null;
+    }
+    
+    const imageBuffer = fs.readFileSync(absolutePath);
+    const base64Data = imageBuffer.toString('base64');
+    
+    // Determine MIME type from extension
+    const ext = path.extname(imagePath).toLowerCase();
+    const mimeTypes = {
+      '.jpg': 'image/jpeg',
+      '.jpeg': 'image/jpeg',
+      '.png': 'image/png',
+      '.gif': 'image/gif',
+      '.webp': 'image/webp'
+    };
+    
+    return {
+      inlineData: {
+        mimeType: mimeTypes[ext] || 'image/jpeg',
+        data: base64Data
+      }
+    };
+  } catch (error) {
+    console.error('Error converting image to base64:', error);
+    return null;
+  }
+}
+
+/**
+ * Analyze an incident description and optional image using Google's Gemini AI
  * @param {string} description - The incident description to analyze
  * @param {string} type - The incident type
+ * @param {string} imagePath - Optional path to image file
  * @returns {Object} - Analysis result with severity, tags, summary, and more
  */
-async function analyzeIncident(description, type = '') {
+async function analyzeIncident(description, type = '', imagePath = null) {
   try {
-    // Get the generative model (updated to gemini-1.5-flash for v1beta)
+    // Get the generative model (gemini-2.5-flash supports vision)
     const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
 
-    // Create the prompt
-    const prompt = `Analyze this emergency incident and return ONLY a JSON object with:
+    // Build the prompt parts
+    const parts = [];
+    
+    // Check if we have an image to analyze
+    const hasImage = imagePath && fs.existsSync(path.resolve(imagePath));
+    
+    if (hasImage) {
+      const imageData = imageToBase64(imagePath);
+      if (imageData) {
+        parts.push(imageData);
+        console.log('Image included in AI analysis:', imagePath);
+      }
+    }
+
+    // Create the text prompt - different based on whether image is included
+    let prompt;
+    if (hasImage) {
+      prompt = `Analyze this emergency incident report WITH the attached image.
+
+IMPORTANT: Carefully analyze the IMAGE to determine:
+1. Does the image actually show an emergency (fire, accident, medical emergency, crime, etc.)?
+2. Does the image match the reported incident type "${type}"?
+3. Is this a real emergency photo or a random/fake image?
+
+Return ONLY a JSON object with:
+- severity (Critical/High/Medium/Low) - based on what you SEE in the image AND description
+- imageAnalysis: {
+    isEmergency: (true/false - does image show an actual emergency?),
+    matchesDescription: (true/false - does image match the description?),
+    confidence: (0-100 - how confident are you this is a real emergency photo?),
+    detectedContent: (what do you actually see in the image?)
+  }
+- suggestedCategory (if the type "${type}" seems wrong based on image, suggest correct one from: Fire, Accident, Medical, Crime, Natural, Other)
+- estimatedResponseTime (in minutes, number)
+- keyDetails (array of important points from BOTH description AND image)
+- tags (array of relevant keywords)
+- summary (short 1-2 sentence summary including what's visible in image)
+
+If the image does NOT show a real emergency or looks fake/random:
+- Set severity to "Low"
+- Set imageAnalysis.isEmergency to false
+- Set imageAnalysis.confidence to a low number
+
+Incident Type: ${type}
+Description: "${description}"
+
+Return ONLY valid JSON, no markdown or extra text.`;
+    } else {
+      prompt = `Analyze this emergency incident and return ONLY a JSON object with:
 - severity (Critical/High/Medium/Low)
-- suggestedCategory (if the type "${type}" seems wrong, suggest correct one from: Fire, Accident, Medical, Crime, Infrastructure)
+- suggestedCategory (if the type "${type}" seems wrong, suggest correct one from: Fire, Accident, Medical, Crime, Natural, Other)
 - estimatedResponseTime (in minutes, number)
 - keyDetails (array of important points extracted from description)
 - tags (array of relevant keywords)
@@ -27,14 +115,18 @@ Incident Type: ${type}
 Description: "${description}"
 
 Return ONLY valid JSON, no markdown or extra text.`;
+    }
+    
+    parts.push({ text: prompt });
 
-    // Generate content
-    const result = await model.generateContent(prompt);
+    // Generate content with image if available
+    const result = await model.generateContent(parts);
     const response = await result.response;
     const text = response.text();
 
+    console.log('Gemini AI Response:', text.substring(0, 500));
+
     // Try to parse JSON from the response
-    // Remove markdown code blocks if present
     const jsonMatch = text.match(/\{[\s\S]*\}/);
     
     if (jsonMatch) {
@@ -66,6 +158,17 @@ Return ONLY valid JSON, no markdown or extra text.`;
         analysis.estimatedResponseTime = 15;
       }
 
+      // If image was analyzed but doesn't match, adjust severity
+      if (analysis.imageAnalysis) {
+        if (!analysis.imageAnalysis.isEmergency || analysis.imageAnalysis.confidence < 30) {
+          console.log('Image analysis indicates non-emergency or low confidence');
+          // Don't override to Critical/High if image doesn't support it
+          if (analysis.severity === 'Critical') {
+            analysis.severity = 'Medium';
+          }
+        }
+      }
+
       return analysis;
     } else {
       throw new Error('Unable to parse JSON from AI response');
@@ -74,14 +177,28 @@ Return ONLY valid JSON, no markdown or extra text.`;
   } catch (error) {
     console.error('AI Analysis Error:', error.message);
     
-    // Return default values on error
+    // Determine severity based on incident type when AI fails
+    const typeSeverityMap = {
+      'Fire': 'High',
+      'Medical': 'High', 
+      'Accident': 'High',
+      'Crime': 'Medium',
+      'Natural': 'High',
+      'Other': 'Medium',
+      'Infrastructure': 'Low'
+    };
+    
+    const fallbackSeverity = typeSeverityMap[type] || 'Medium';
+    
+    // Return default values on error with type-based severity
     return {
-      severity: 'Medium',
+      severity: fallbackSeverity,
       suggestedCategory: null,
-      estimatedResponseTime: 15,
-      keyDetails: ['Emergency reported'],
-      tags: ['emergency', 'incident'],
-      summary: 'Emergency incident reported - AI analysis unavailable'
+      estimatedResponseTime: type === 'Fire' ? 8 : type === 'Medical' ? 5 : 12,
+      keyDetails: [`${type} emergency reported`, 'Location captured', 'Awaiting responder dispatch'],
+      tags: ['emergency', type.toLowerCase()],
+      summary: `${type} emergency incident reported. AI analysis temporarily unavailable.`,
+      aiStatus: 'fallback' // Flag to indicate AI was unavailable
     };
   }
 }

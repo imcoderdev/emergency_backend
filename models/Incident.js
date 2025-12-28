@@ -4,7 +4,7 @@ const incidentSchema = new mongoose.Schema({
   type: {
     type: String,
     required: true,
-    enum: ['Fire', 'Accident', 'Medical', 'Crime', 'Infrastructure']
+    enum: ['Fire', 'Accident', 'Medical', 'Crime', 'Infrastructure', 'Natural', 'Other']
   },
   description: {
     type: String,

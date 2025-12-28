@@ -70,8 +70,8 @@ router.post('/report', upload.single('media'), async (req, res) => {
       });
     }
 
-    // Validate type
-    const validTypes = ['Fire', 'Accident', 'Medical', 'Crime', 'Infrastructure'];
+    // Validate type - expanded to include all categories
+    const validTypes = ['Fire', 'Accident', 'Medical', 'Crime', 'Infrastructure', 'Natural', 'Other'];
     if (!validTypes.includes(type)) {
       return res.status(400).json({
         error: `Invalid type. Must be one of: ${validTypes.join(', ')}`
@@ -133,8 +133,60 @@ router.post('/report', upload.single('media'), async (req, res) => {
       });
     }
 
-    // Analyze with AI
-    const aiAnalysis = await analyzeIncident(description, type);
+    // Analyze with AI (include image if uploaded)
+    const imagePath = req.file ? `uploads/${req.file.filename}` : null;
+    const aiAnalysis = await analyzeIncident(description, type, imagePath);
+
+    // Log image analysis results if available
+    if (aiAnalysis.imageAnalysis) {
+      console.log('Image Analysis Result:', {
+        isEmergency: aiAnalysis.imageAnalysis.isEmergency,
+        confidence: aiAnalysis.imageAnalysis.confidence,
+        detectedContent: aiAnalysis.imageAnalysis.detectedContent
+      });
+    }
+
+    // Calculate priority score based on AI analysis and image
+    let priorityScore = 50; // Base score
+    console.log('Priority Calculation - Starting with base:', priorityScore);
+    console.log('Priority Calculation - AI Severity:', aiAnalysis.severity);
+    
+    // Severity contribution (up to 40 points)
+    const severityScores = { Critical: 40, High: 30, Medium: 20, Low: 10 };
+    const severityBonus = severityScores[aiAnalysis.severity] || 20;
+    priorityScore += severityBonus;
+    console.log('Priority Calculation - Severity bonus:', severityBonus, '-> Total:', priorityScore);
+    
+    // Image analysis contribution
+    if (aiAnalysis.imageAnalysis) {
+      console.log('Priority Calculation - Image analysis found:', aiAnalysis.imageAnalysis);
+      if (aiAnalysis.imageAnalysis.isEmergency) {
+        // Real emergency image - boost score based on confidence
+        const imageBonus = Math.round(aiAnalysis.imageAnalysis.confidence * 0.2);
+        priorityScore += imageBonus;
+        console.log('Priority Calculation - Emergency image bonus:', imageBonus, '-> Total:', priorityScore);
+      } else {
+        // Not a real emergency image - reduce score significantly
+        priorityScore -= 30;
+        console.log('Priority Calculation - Non-emergency image penalty: -30 -> Total:', priorityScore);
+        // Also downgrade severity if image doesn't show emergency
+        if (aiAnalysis.severity === 'Critical') {
+          aiAnalysis.severity = 'Medium';
+        } else if (aiAnalysis.severity === 'High') {
+          aiAnalysis.severity = 'Medium';
+        }
+      }
+    } else {
+      console.log('Priority Calculation - No image analysis present');
+    }
+    
+    // Clamp score between 10-100
+    priorityScore = Math.max(10, Math.min(100, priorityScore));
+    console.log('Priority Calculation - FINAL SCORE:', priorityScore);
+    
+    // Add priority score to AI analysis
+    aiAnalysis.priorityScore = priorityScore;
+    console.log('Priority Calculation - Added to ai_analysis:', JSON.stringify(aiAnalysis, null, 2));
 
     // Create new incident
     const newIncident = new Incident({
@@ -319,6 +371,119 @@ router.get('/stats', async (req, res) => {
 });
 
 /**
+ * GET /check-duplicates - Check for potential duplicate incidents
+ * Query params: type, lat, lng, timestamp (optional), description (optional)
+ */
+router.get('/check-duplicates', async (req, res) => {
+  try {
+    const { type, lat, lng, description = '' } = req.query;
+
+    // Validate required params
+    if (!type || !lat || !lng) {
+      return res.status(400).json({
+        error: 'Missing required query parameters: type, lat, lng'
+      });
+    }
+
+    const latitude = parseFloat(lat);
+    const longitude = parseFloat(lng);
+
+    // Get incidents from last 2 hours
+    const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000);
+    
+    // Find nearby incidents using MongoDB geospatial query
+    const nearbyIncidents = await Incident.find({
+      timestamp: { $gte: twoHoursAgo },
+      status: { $nin: ['Resolved', 'Closed'] },
+      'location.coordinates': {
+        $nearSphere: {
+          $geometry: {
+            type: 'Point',
+            coordinates: [longitude, latitude]
+          },
+          $maxDistance: 500 // 500 meters
+        }
+      }
+    }).lean();
+
+    if (nearbyIncidents.length === 0) {
+      return res.status(200).json({
+        duplicates: [],
+        message: 'No nearby incidents found'
+      });
+    }
+
+    // Calculate similarity scores for each nearby incident
+    const duplicates = nearbyIncidents.map(incident => {
+      // Distance calculation
+      const distance = calculateDistance(latitude, longitude, incident.location.lat, incident.location.lng);
+      
+      // Distance score: 100 at 0m, 50 at 500m
+      const distanceScore = Math.max(0, 100 - (distance / 5));
+      
+      // Time score: 100 at 0min, 50 at 2hrs
+      const timeDiff = Date.now() - new Date(incident.timestamp).getTime();
+      const timeScore = Math.max(0, 100 - (timeDiff / (2 * 60 * 60 * 10)));
+      
+      // Type match bonus
+      const typeBonus = incident.type === type ? 20 : 0;
+      
+      // Calculate confidence
+      const confidence = Math.round((distanceScore + timeScore + typeBonus) / 2.2);
+
+      return {
+        _id: incident._id,
+        type: incident.type,
+        description: incident.description,
+        location: incident.location,
+        timestamp: incident.timestamp,
+        severity: incident.severity,
+        status: incident.status,
+        upvotes: incident.upvotes,
+        verified: incident.verified,
+        confidence: Math.min(100, confidence),
+        distance: Math.round(distance)
+      };
+    }).filter(d => d.confidence > 40) // Only return if confidence > 40%
+      .sort((a, b) => b.confidence - a.confidence);
+
+    // Use AI for description comparison if provided
+    if (description && duplicates.length > 0) {
+      const aiDuplicates = await detectDuplicates(
+        { type, description, location: { lat: latitude, lng: longitude } },
+        nearbyIncidents
+      );
+
+      // Merge AI confidence with distance-based confidence
+      duplicates.forEach(dup => {
+        const aiMatch = aiDuplicates.find(ai => ai.incidentId?.toString() === dup._id.toString());
+        if (aiMatch) {
+          dup.confidence = Math.round((dup.confidence + aiMatch.confidence) / 2);
+          dup.aiReason = aiMatch.reason;
+        }
+      });
+
+      duplicates.sort((a, b) => b.confidence - a.confidence);
+    }
+
+    return res.status(200).json({
+      duplicates,
+      count: duplicates.length,
+      message: duplicates.length > 0 
+        ? `Found ${duplicates.length} potential duplicate(s)` 
+        : 'No duplicates found'
+    });
+
+  } catch (error) {
+    console.error('Error checking duplicates:', error);
+    return res.status(500).json({
+      error: 'Failed to check duplicates',
+      message: error.message
+    });
+  }
+});
+
+/**
  * GET /priority-queue - Get incidents sorted by priority
  */
 router.get('/priority-queue', async (req, res) => {
@@ -369,6 +534,76 @@ router.get('/:id', async (req, res) => {
   } catch (error) {
     console.error('Error fetching incident:', error);
     return res.status(500).json({ error: 'Failed to fetch incident' });
+  }
+});
+
+/**
+ * POST /:id/analyze - Re-analyze incident with AI
+ * Returns fresh AI analysis for the incident
+ */
+router.post('/:id/analyze', async (req, res) => {
+  try {
+    const incident = await Incident.findById(req.params.id);
+    
+    if (!incident) {
+      return res.status(404).json({ error: 'Incident not found' });
+    }
+
+    // Run AI analysis
+    const aiAnalysis = await analyzeIncident(incident.description, incident.type);
+    
+    // Update incident with new AI analysis
+    incident.ai_analysis = aiAnalysis;
+    incident.severity = aiAnalysis.severity;
+    await incident.save();
+
+    // Calculate priority
+    const priority = calculatePriority(incident.toObject());
+    const priorityLevel = getPriorityLevel(priority);
+
+    return res.status(200).json({
+      success: true,
+      incident: incident,
+      aiAnalysis: aiAnalysis,
+      priority: priority,
+      priorityLevel: priorityLevel
+    });
+
+  } catch (error) {
+    console.error('Error analyzing incident:', error);
+    return res.status(500).json({ 
+      error: 'Failed to analyze incident',
+      message: error.message 
+    });
+  }
+});
+
+/**
+ * POST /analyze-text - Analyze text without creating incident
+ * Useful for pre-submission analysis
+ */
+router.post('/analyze-text', async (req, res) => {
+  try {
+    const { description, type } = req.body;
+
+    if (!description) {
+      return res.status(400).json({ error: 'Description is required' });
+    }
+
+    // Run AI analysis
+    const aiAnalysis = await analyzeIncident(description, type || 'General');
+
+    return res.status(200).json({
+      success: true,
+      analysis: aiAnalysis
+    });
+
+  } catch (error) {
+    console.error('Error analyzing text:', error);
+    return res.status(500).json({ 
+      error: 'Failed to analyze text',
+      message: error.message 
+    });
   }
 });
 
