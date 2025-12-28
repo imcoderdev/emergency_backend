@@ -19,16 +19,38 @@ if (!fs.existsSync(uploadsDir)) {
 // Socket.IO setup with CORS
 const io = socketIo(server, {
   cors: {
-    origin: '*',
-    methods: ['GET', 'POST', 'PATCH', 'DELETE']
+    origin: [
+      'http://localhost:5173',
+      'https://emergency-frontend-gx2k-git-main-devs-projects-89798064.vercel.app'
+    ],
+    methods: ['GET', 'POST', 'PATCH', 'DELETE'],
+    credentials: true
   }
 });
 
 // Make io accessible to routes
 app.set('io', io);
 
+// Allowed origins for CORS
+const allowedOrigins = [
+  'http://localhost:5173',
+  'https://emergency-frontend-gx2k-git-main-devs-projects-89798064.vercel.app'
+];
+
 // Middleware
-app.use(cors()); // Enable CORS for all routes
+app.use(cors({
+  origin: (origin, callback) => {
+    // Allow requests with no origin (like mobile apps or Postman)
+    if (!origin) return callback(null, true);
+    
+    if (allowedOrigins.includes(origin)) {
+      callback(null, true);
+    } else {
+      callback(new Error('Not allowed by CORS'));
+    }
+  },
+  credentials: true
+}));
 app.use(express.json()); // JSON parsing middleware
 app.use(express.urlencoded({ extended: true })); // Parse URL-encoded bodies
 
